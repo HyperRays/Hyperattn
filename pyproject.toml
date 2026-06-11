@@ -7,9 +7,25 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "accelerate>=1.13.0",
     "datasets>=5.0.0",
-    "jax==0.4.34",
-    "jax-metal>=0.1.1",
-    "jaxlib==0.4.34",
+    # Apple Silicon: pinned jax + experimental Metal backend
+    "jax==0.4.34; sys_platform == 'darwin'",
+    "jax-metal>=0.1.1; sys_platform == 'darwin'",
+    "jaxlib==0.4.34; sys_platform == 'darwin'",
+    # Linux (CUDA boxes): recent jax with bundled CUDA 12 plugins
+    "jax[cuda12]>=0.5; sys_platform == 'linux'",
     "torch>=2.12.0",
     "transformers>=5.11.0",
 ]
+
+[dependency-groups]
+dev = ["ipykernel>=6"]
+
+# CPU-only torch on Linux: it is only used for parameter init, and CUDA torch's
+# bundled nvidia-* wheels can clash with jax[cuda12]'s CUDA/cuDNN plugins.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
