@@ -1,0 +1,119 @@
+{
+  "rows": [
+    {
+      "measure": "full",
+      "mode": "forward",
+      "length": 256,
+      "batch_size": 1,
+      "mean_ms": 28.297043749989825,
+      "std_ms": 0.3831654969001874,
+      "tokens_per_s": 9046.88144322822,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "full",
+      "mode": "forward",
+      "length": 512,
+      "batch_size": 1,
+      "mean_ms": 62.08616044932569,
+      "std_ms": 1.7950403673277193,
+      "tokens_per_s": 8246.604336531504,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "full",
+      "mode": "forward",
+      "length": 1024,
+      "batch_size": 1,
+      "mean_ms": 134.92113129941572,
+      "std_ms": 4.356388254310737,
+      "tokens_per_s": 7589.619136290436,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "full",
+      "mode": "forward",
+      "length": 2048,
+      "batch_size": 1,
+      "mean_ms": 279.9601999002334,
+      "std_ms": 3.946542428649756,
+      "tokens_per_s": 7315.325538165157,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "full",
+      "mode": "forward",
+      "length": 4096,
+      "batch_size": 1,
+      "mean_ms": 590.3645106009208,
+      "std_ms": 13.293236619164437,
+      "tokens_per_s": 6938.086430416964,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "backbone",
+      "mode": "forward",
+      "length": 256,
+      "batch_size": 1,
+      "mean_ms": 25.079756251216168,
+      "std_ms": 0.6111678461391544,
+      "tokens_per_s": 10207.435727673232,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "backbone",
+      "mode": "forward",
+      "length": 512,
+      "batch_size": 1,
+      "mean_ms": 53.25391244987259,
+      "std_ms": 1.1609836340355122,
+      "tokens_per_s": 9614.31707918063,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "backbone",
+      "mode": "forward",
+      "length": 1024,
+      "batch_size": 1,
+      "mean_ms": 112.94897494917677,
+      "std_ms": 2.553500537856992,
+      "tokens_per_s": 9066.040665360313,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "backbone",
+      "mode": "forward",
+      "length": 2048,
+      "batch_size": 1,
+      "mean_ms": 247.89833334980358,
+      "std_ms": 12.3169139782452,
+      "tokens_per_s": 8261.451266435563,
+      "max_memory_mb": null
+    },
+    {
+      "measure": "backbone",
+      "mode": "forward",
+      "length": 4096,
+      "batch_size": 1,
+      "mean_ms": 542.9334582495358,
+      "std_ms": 39.044016843509965,
+      "tokens_per_s": 7544.202586456648,
+      "max_memory_mb": null
+    }
+  ],
+  "summary": {
+    "latency_power_law": {
+      "backbone": {
+        "exponent": 1.1091149467566412,
+        "coefficient": 0.052813723992186645,
+        "r2": 0.9998758849235001
+      },
+      "full": {
+        "exponent": 1.093864362836775,
+        "coefficient": 0.06694939118890576,
+        "r2": 0.9997683278732954
+      }
+    },
+    "memory_power_law": {}
+  }
+}
