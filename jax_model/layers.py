@@ -153,6 +153,18 @@ def span_block_forward(params, x, cfg, span_backend="materialized"):
     return x
 
 
+def span_stack_forward(params, x, cfg, span_backend="materialized", remat_blocks=False):
+    def step(h, block_params):
+        def forward_one(p, y):
+            return span_block_forward(p, y, cfg, span_backend)
+
+        h = jax.checkpoint(forward_one)(block_params, h) if remat_blocks else forward_one(block_params, h)
+        return h, None
+
+    x, _ = jax.lax.scan(step, x, params)
+    return x
+
+
 def _compress_blocks(params, y, compression_block):
     B, T, C = y.shape
     cb = compression_block

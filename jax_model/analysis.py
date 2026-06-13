@@ -33,7 +33,17 @@ def _ablate_block(params, i):
     return {**params, "blocks": blocks}
 
 
-def block_ablation_deltas(params, idx, targets, cfg, *, attention_backend="chunked", span_backend="materialized"):
+def block_ablation_deltas(
+    params,
+    idx,
+    targets,
+    cfg,
+    *,
+    attention_backend="chunked",
+    span_backend="materialized",
+    remat_blocks=False,
+    scan_span_runs=False,
+):
     """Per-block importance = rise in loss when each block's mixer write is zeroed.
 
     Returns (baseline_loss, [(index, kind, delta_loss), ...]). This is the honest
@@ -42,7 +52,12 @@ def block_ablation_deltas(params, idx, targets, cfg, *, attention_backend="chunk
     every eval_interval), not every step. Only the mixer sublayer is ablated; each
     block's MLP is left in place.
     """
-    kw = dict(attention_backend=attention_backend, span_backend=span_backend)
+    kw = dict(
+        attention_backend=attention_backend,
+        span_backend=span_backend,
+        remat_blocks=remat_blocks,
+        scan_span_runs=scan_span_runs,
+    )
     base = float(loss(params, idx, targets, cfg, **kw))
     deltas = []
     for i, b in enumerate(params["blocks"]):
@@ -95,14 +110,31 @@ def backbone_diagnostics(params, idx, cfg, *, attention_backend="chunked", span_
 
 
 def position_bucketed_loss(
-    params, idx, targets, cfg, n_buckets=4, *, attention_backend="chunked", span_backend="materialized"
+    params,
+    idx,
+    targets,
+    cfg,
+    n_buckets=4,
+    *,
+    attention_backend="chunked",
+    span_backend="materialized",
+    remat_blocks=False,
+    scan_span_runs=False,
 ):
     """Mean next-token loss split into n_buckets along the sequence (early -> late).
 
     A falling early->late curve means the model exploits longer context; a flat curve
     means its effective context is capped (the long-range capability has not emerged).
     """
-    hidden = forward_backbone(params, idx, cfg, attention_backend=attention_backend, span_backend=span_backend)
+    hidden = forward_backbone(
+        params,
+        idx,
+        cfg,
+        attention_backend=attention_backend,
+        span_backend=span_backend,
+        remat_blocks=remat_blocks,
+        scan_span_runs=scan_span_runs,
+    )
     tok = linear_cross_entropy_tokens(hidden, params["token_embedding"]["weight"], targets)
     tok = jnp.mean(tok, axis=0)
     T = tok.shape[0]

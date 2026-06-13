@@ -199,12 +199,34 @@ class JaxModelParityTest(unittest.TestCase):
         )
         self.assert_close(actual_materialized, expected.numpy())
 
+        actual_scanned = jax_model.forward(
+            self.params,
+            jnp.asarray(self.idx.numpy()),
+            self.jax_cfg,
+            attention_backend="chunked",
+            span_backend="fused",
+            remat_blocks=True,
+            scan_span_runs=True,
+        )
+        self.assert_close(actual_scanned, expected.numpy())
+
     def test_loss_and_grad_smoke(self):
         targets = torch.randint(0, self.cfg.vocab_size, (2, self.cfg.block_size))
         with torch.no_grad():
             _, expected = self.torch_model(self.idx, targets)
         actual = jax_model.loss(self.params, jnp.asarray(self.idx.numpy()), jnp.asarray(targets.numpy()), self.jax_cfg)
         self.assert_close(actual, expected.numpy())
+        actual_scanned = jax_model.loss(
+            self.params,
+            jnp.asarray(self.idx.numpy()),
+            jnp.asarray(targets.numpy()),
+            self.jax_cfg,
+            attention_backend="chunked",
+            span_backend="fused",
+            remat_blocks=True,
+            scan_span_runs=True,
+        )
+        self.assert_close(actual_scanned, expected.numpy())
 
         grads = jax.grad(
             lambda p: jax_model.loss(p, jnp.asarray(self.idx.numpy()), jnp.asarray(targets.numpy()), self.jax_cfg)
@@ -236,6 +258,16 @@ class JaxModelParityTest(unittest.TestCase):
             expected, _ = torch_model(idx)
         actual = jax_model.forward(params, jnp.asarray(idx.numpy()), jax_cfg, attention_backend="chunked")
         self.assert_close(actual, expected.numpy())
+        actual_scanned = jax_model.forward(
+            params,
+            jnp.asarray(idx.numpy()),
+            jax_cfg,
+            attention_backend="chunked",
+            span_backend="fused",
+            remat_blocks=True,
+            scan_span_runs=True,
+        )
+        self.assert_close(actual_scanned, expected.numpy())
 
         # ablation hook returns one finite delta per block, with kinds matching the layout
         targets = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
