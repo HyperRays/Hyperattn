@@ -14,9 +14,13 @@ class EfficientHGConfig:
     local_window: int = 256
     compression_block: int = 64
     dropout: float = 0.1
+    # Resolved block stack (tuple of "attn"/"span"/"hca"); informational on the JAX
+    # side, where the forward pass dispatches per block on the converted param keys.
+    block_layout: tuple = None
 
 
 def from_torch_config(cfg):
+    layout = getattr(cfg, "block_layout", None)
     return EfficientHGConfig(
         vocab_size=cfg.vocab_size,
         block_size=cfg.block_size,
@@ -29,4 +33,5 @@ def from_torch_config(cfg):
         local_window=cfg.local_window,
         compression_block=cfg.compression_block,
         dropout=cfg.dropout,
+        block_layout=tuple(layout) if layout is not None else None,
     )

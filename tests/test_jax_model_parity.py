@@ -199,6 +199,39 @@ class JaxModelParityTest(unittest.TestCase):
         )
         self.assert_close(actual_materialized, expected.numpy())
 
+    def test_custom_block_layout_parity_and_ablation(self):
+        layout = ("attn", "span", "span", "hca", "span", "span")
+        cfg = EfficientHGConfig(
+            vocab_size=37,
+            block_size=8,
+            n_embd=16,
+            n_head=4,
+            span_widths=(2, 4),
+            local_window=4,
+            compression_block=4,
+            dropout=0.0,
+            block_layout=layout,
+        )
+        torch_model = EfficientHypergraphLM(cfg).eval()
+        self.assertEqual(tuple(torch_model.block_layout), layout)
+        params, jax_cfg = jax_model.from_torch_model(torch_model)
+        self.assertEqual(jax_cfg.block_layout, layout)
+        self.assertEqual(len(params["blocks"]), len(layout))
+
+        idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+        with torch.no_grad():
+            expected, _ = torch_model(idx)
+        actual = jax_model.forward(params, jnp.asarray(idx.numpy()), jax_cfg, attention_backend="chunked")
+        self.assert_close(actual, expected.numpy())
+
+        # ablation hook returns one finite delta per block, with kinds matching the layout
+        targets = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+        base, deltas = jax_model.block_ablation_deltas(
+            params, jnp.asarray(idx.numpy()), jnp.asarray(targets.numpy()), jax_cfg, attention_backend="chunked"
+        )
+        self.assertEqual([k for _, k, _ in deltas], list(layout))
+        self.assertTrue(all(np.isfinite(d) for _, _, d in deltas))
+
     def test_span_grad_smoke(self):
         for length, widths in [(5, (2, 3)), (8, (2, 4, 6))]:
             h = jnp.arange(2 * length * 3, dtype=jnp.float32).reshape(2, length, 3) / 10.0

@@ -11,6 +11,35 @@ from .config import EfficientHGConfig
 from .rope import precompute_rope_cache
 
 
+_BLOCK_BUILDERS = {
+    "attn": LocalAttentionBlock,
+    "span": CausalSpanHypergraphBlock,
+    "hca": CausalCompressedMemoryAttentionBlock,
+    "mem": CausalCompressedMemoryAttentionBlock,
+}
+
+
+def _default_layout(cfg: EfficientHGConfig):
+    """Legacy stack: local attention, then span layers with memory blocks interleaved."""
+    layout = ["attn"] * cfg.n_local_attn_layers
+    mem_insert_every = max(1, cfg.n_span_layers // max(1, cfg.n_compressed_memory_layers))
+    mem_inserted = 0
+    for i in range(cfg.n_span_layers):
+        layout.append("span")
+        if mem_inserted < cfg.n_compressed_memory_layers and ((i + 1) % mem_insert_every == 0):
+            layout.append("hca")
+            mem_inserted += 1
+    return tuple(layout)
+
+
+def resolve_block_layout(cfg: EfficientHGConfig):
+    layout = cfg.block_layout if cfg.block_layout is not None else _default_layout(cfg)
+    unknown = [name for name in layout if name not in _BLOCK_BUILDERS]
+    if unknown:
+        raise ValueError(f"unknown block types {unknown}; valid: {sorted(_BLOCK_BUILDERS)}")
+    return tuple(layout)
+
+
 class EfficientHypergraphLM(nn.Module):
     def __init__(self, cfg: EfficientHGConfig):
         super().__init__()
@@ -18,17 +47,8 @@ class EfficientHypergraphLM(nn.Module):
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.drop = nn.Dropout(cfg.dropout)
 
-        blocks = []
-        for _ in range(cfg.n_local_attn_layers):
-            blocks.append(LocalAttentionBlock(cfg))
-
-        mem_insert_every = max(1, cfg.n_span_layers // max(1, cfg.n_compressed_memory_layers))
-        mem_inserted = 0
-        for i in range(cfg.n_span_layers):
-            blocks.append(CausalSpanHypergraphBlock(cfg))
-            if mem_inserted < cfg.n_compressed_memory_layers and ((i + 1) % mem_insert_every == 0):
-                blocks.append(CausalCompressedMemoryAttentionBlock(cfg))
-                mem_inserted += 1
+        self.block_layout = resolve_block_layout(cfg)
+        blocks = [_BLOCK_BUILDERS[name](cfg) for name in self.block_layout]
 
         self.blocks = nn.ModuleList(blocks)
         self.ln_f = nn.LayerNorm(cfg.n_embd)

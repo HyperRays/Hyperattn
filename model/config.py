@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -14,3 +15,6 @@ class EfficientHGConfig:
     local_window: int = 256
     compression_block: int = 64
     dropout: float = 0.1
+    # Explicit block stack, e.g. ("attn", "span", "span", "hca", "span", "span").
+    # When None, the stack is derived from the n_*_layers counts (legacy behavior).
+    block_layout: Optional[Tuple[str, ...]] = None
