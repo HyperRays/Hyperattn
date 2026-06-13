@@ -3,9 +3,9 @@ import math
 import jax
 import jax.numpy as jnp
 
-from .language_model import forward, loss
+from .language_model import forward_backbone, loss
 from .layers import _compress_blocks, _mask_fill_value, block_forward
-from .ops import layer_norm, linear
+from .ops import layer_norm, linear, linear_cross_entropy_tokens
 from .rope import apply_rope, apply_rope_at_positions, precompute_rope_cache
 
 
@@ -102,9 +102,8 @@ def position_bucketed_loss(
     A falling early->late curve means the model exploits longer context; a flat curve
     means its effective context is capped (the long-range capability has not emerged).
     """
-    logits = forward(params, idx, cfg, attention_backend=attention_backend, span_backend=span_backend)
-    logp = jax.nn.log_softmax(logits, axis=-1)
-    tok = -jnp.take_along_axis(logp, targets[..., None], axis=-1).squeeze(-1)
+    hidden = forward_backbone(params, idx, cfg, attention_backend=attention_backend, span_backend=span_backend)
+    tok = linear_cross_entropy_tokens(hidden, params["token_embedding"]["weight"], targets)
     tok = jnp.mean(tok, axis=0)
     T = tok.shape[0]
     edges = [round(b * T / n_buckets) for b in range(n_buckets + 1)]

@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
 from .layers import block_forward
-from .ops import layer_norm, softmax_cross_entropy
+from .ops import layer_norm, linear_cross_entropy
 from .rope import precompute_rope_cache
 
 
@@ -21,8 +21,8 @@ def forward(params, idx, cfg, *, attention_backend="windowed", span_backend="mat
 
 
 def loss(params, idx, targets, cfg, *, attention_backend="windowed", span_backend="materialized"):
-    logits = forward(params, idx, cfg, attention_backend=attention_backend, span_backend=span_backend)
-    return softmax_cross_entropy(logits, targets)
+    hidden = forward_backbone(params, idx, cfg, attention_backend=attention_backend, span_backend=span_backend)
+    return linear_cross_entropy(hidden, params["token_embedding"]["weight"], targets)
 
 
 def count_parameters(params):

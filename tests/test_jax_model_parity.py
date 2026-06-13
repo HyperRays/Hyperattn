@@ -199,6 +199,19 @@ class JaxModelParityTest(unittest.TestCase):
         )
         self.assert_close(actual_materialized, expected.numpy())
 
+    def test_loss_and_grad_smoke(self):
+        targets = torch.randint(0, self.cfg.vocab_size, (2, self.cfg.block_size))
+        with torch.no_grad():
+            _, expected = self.torch_model(self.idx, targets)
+        actual = jax_model.loss(self.params, jnp.asarray(self.idx.numpy()), jnp.asarray(targets.numpy()), self.jax_cfg)
+        self.assert_close(actual, expected.numpy())
+
+        grads = jax.grad(
+            lambda p: jax_model.loss(p, jnp.asarray(self.idx.numpy()), jnp.asarray(targets.numpy()), self.jax_cfg)
+        )(self.params)
+        for leaf in jax.tree.leaves(grads):
+            self.assertTrue(bool(jnp.all(jnp.isfinite(leaf))))
+
     def test_custom_block_layout_parity_and_ablation(self):
         layout = ("attn", "span", "span", "hca", "span", "span")
         cfg = EfficientHGConfig(
