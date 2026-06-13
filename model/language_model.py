@@ -19,6 +19,66 @@ _BLOCK_BUILDERS = {
 }
 
 
+def _apply_top_p(logits, top_p, min_tokens_to_keep=1):
+    if top_p is None or top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+    sorted_probs = F.softmax(sorted_logits, dim=-1)
+    cumulative = sorted_probs.cumsum(dim=-1)
+    remove = cumulative > top_p
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., :min_tokens_to_keep] = False
+    remove[..., 0] = False
+    sorted_logits = sorted_logits.masked_fill(remove, -float("inf"))
+    return torch.full_like(logits, -float("inf")).scatter(-1, sorted_idx, sorted_logits)
+
+
+def _apply_no_repeat_ngram(logits, idx, ngram_size):
+    if ngram_size is None or ngram_size <= 0 or idx.size(1) < ngram_size - 1:
+        return logits
+    prefix_len = ngram_size - 1
+    for b in range(idx.size(0)):
+        tokens = idx[b].tolist()
+        prefix = tuple(tokens[-prefix_len:]) if prefix_len else tuple()
+        banned = []
+        for i in range(len(tokens) - ngram_size + 1):
+            if tuple(tokens[i : i + prefix_len]) == prefix:
+                banned.append(tokens[i + prefix_len])
+        if banned:
+            logits[b, torch.tensor(banned, device=logits.device)] = -float("inf")
+    return logits
+
+
+def _apply_token_penalties(
+    logits,
+    idx,
+    *,
+    repetition_penalty=1.0,
+    repetition_window=None,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+):
+    if (
+        (repetition_penalty is None or repetition_penalty == 1.0)
+        and frequency_penalty == 0.0
+        and presence_penalty == 0.0
+    ):
+        return logits
+
+    recent = idx if repetition_window is None else idx[:, -repetition_window:]
+    for b in range(idx.size(0)):
+        tokens, counts = torch.unique(recent[b], return_counts=True)
+        selected = logits[b, tokens]
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            selected = torch.where(selected > 0, selected / repetition_penalty, selected * repetition_penalty)
+        if presence_penalty:
+            selected = selected - presence_penalty
+        if frequency_penalty:
+            selected = selected - frequency_penalty * counts.to(selected.dtype)
+        logits[b, tokens] = selected
+    return logits
+
+
 def _default_layout(cfg: EfficientHGConfig):
     """Legacy stack: local attention, then span layers with memory blocks interleaved."""
     layout = ["attn"] * cfg.n_local_attn_layers
@@ -79,18 +139,47 @@ class EfficientHypergraphLM(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=50):
+    def generate(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=0.8,
+        top_k=50,
+        top_p=None,
+        repetition_penalty=1.0,
+        repetition_window=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        no_repeat_ngram_size=None,
+        eos_token_id=None,
+        min_new_tokens=0,
+    ):
         self.eval()
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             idx_cond = idx[:, -self.cfg.block_size :]
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
+            logits = logits[:, -1, :]
+            logits = _apply_token_penalties(
+                logits,
+                idx,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+            )
+            logits = _apply_no_repeat_ngram(logits, idx, no_repeat_ngram_size)
+            if eos_token_id is not None and step < min_new_tokens:
+                logits[:, eos_token_id] = -float("inf")
+            logits = logits / max(temperature, 1e-8)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("inf")
+            logits = _apply_top_p(logits, top_p)
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
+            if eos_token_id is not None and torch.all(next_id == eos_token_id):
+                break
         return idx
 
 
