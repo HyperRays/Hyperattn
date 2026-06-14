@@ -28,18 +28,23 @@ def _scan_routed_span_run(stacked_params, x0, window, cfg, kind, span_backend, r
     ``window`` is [B, K, T, C] (K = max_sources - 1), oldest-first, newest == x_prev.
     """
 
-    def step(win, block_params):
+    def body(win, block_params):
         x_prev = win[:, -1]
         bank = jnp.concatenate([x0[:, None], win], axis=1)  # [B, max_sources, T, C]
         routed = tokenwise_layer_attention_from_bank(block_params["route"], x_prev, bank, cfg)
         gate = jax.nn.sigmoid(block_params["route"]["gate"])
         x_in = gate * routed + (1.0 - gate) * x_prev
+        x_out = span_block_forward(block_params, x_in, cfg, kind, span_backend)
+        return jnp.concatenate([win[:, 1:], x_out[:, None]], axis=1)
 
-        def apply(p, h):
-            return span_block_forward(p, h, cfg, kind, span_backend)
+    # Remat the WHOLE step (routing + block), matching the unrolled path. Otherwise the scan
+    # saves the per-step bank [B, max_sources, T, C] stacked over the run length for backward
+    # (e.g. bf16[16, B, 8, T, C] ~= 6G per run on TPU); rematerializing recomputes it instead,
+    # so the scan only carries the window.
+    body = jax.checkpoint(body) if remat_blocks else body
 
-        x_out = jax.checkpoint(apply)(block_params, x_in) if remat_blocks else apply(block_params, x_in)
-        return jnp.concatenate([win[:, 1:], x_out[:, None]], axis=1), None
+    def step(win, block_params):
+        return body(win, block_params), None
 
     window, _ = jax.lax.scan(step, window, stacked_params)
     return window  # final window; x_out of the run == window[:, -1]
