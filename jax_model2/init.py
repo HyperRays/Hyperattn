@@ -35,8 +35,8 @@ def _mlp(key, cfg):
 
 
 def _route(key, cfg):
-    kq, kk = _split(key, 2)
-    return {
+    kq, kk, kw = _split(key, 3)
+    route = {
         "ln": _layer_norm(cfg.n_embd),
         "q_proj": _linear(kq, cfg.n_embd, cfg.n_embd, cfg.initializer_std, bias=False),
         "k_proj": _linear(kk, cfg.n_embd, cfg.n_embd, cfg.initializer_std, bias=False),
@@ -46,6 +46,11 @@ def _route(key, cfg):
         "out_proj": _identity_linear(cfg.n_embd),
         "gate": jnp.asarray(cfg.route_gate_init, dtype=jnp.float32),
     }
+    if cfg.use_memory_router:
+        # Learned softmax write that folds this block's output into the streaming memory
+        # (slots 1..layer_memory_slots-1; slot 0 is the embedding).
+        route["write_score"] = _linear(kw, cfg.layer_memory_slots - 1, cfg.n_embd, cfg.initializer_std)
+    return route
 
 
 def _attn_block(key, cfg):
@@ -88,6 +93,12 @@ def init_params(key, cfg):
         "blocks": [],
         "ln_f": _layer_norm(cfg.n_embd),
     }
+    if cfg.use_memory_router:
+        assert cfg.layer_memory_slots >= 2, "layer_memory_slots must be >= 2 (embedding + >=1 memory slot)"
+        # Per-slot init for the streaming memory (slots 1..n-1); slot 0 is the embedding at runtime.
+        params["mem_init"] = cfg.initializer_std * jax.random.normal(
+            keys[-1], (cfg.layer_memory_slots - 1, cfg.n_embd), dtype=jnp.float32
+        )
     for kind, block_key in zip(layout, keys[1:-1]):
         if kind == "attn":
             params["blocks"].append(_attn_block(block_key, cfg))

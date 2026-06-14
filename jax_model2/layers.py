@@ -40,6 +40,31 @@ def tokenwise_layer_attention(params, x_prev, states, cfg):
     return tokenwise_layer_attention_from_bank(params, x_prev, bank, cfg)
 
 
+def memory_router_write(route, mem, out, cfg):
+    """HCA-style learned write: fold this block's output into the streaming memory.
+
+    ``mem`` is [B, S, T, C] (S = layer_memory_slots - 1 streaming slots). A learned per-token
+    softmax over slots decides where ``out`` ([B, T, C]) is written; each slot is a convex blend
+    toward ``out`` by its weight. Streaming analogue of model 1's _compress_blocks pooling, on
+    the layer axis instead of the token axis.
+    """
+    score = linear(out, route["write_score"])  # [B, T, S]
+    w = jax.nn.softmax(score.astype(jnp.float32), axis=-1).astype(out.dtype)
+    w = jnp.moveaxis(w, -1, 1)[..., None]  # [B, S, T, 1]
+    return (1.0 - w) * mem + w * out[:, None]  # [B, S, T, C]
+
+
+def route_block_input_memory(route, x_prev, mem_bank, cfg):
+    """Read side of the memory router: attend (per token) over the memory slots, then gate.
+
+    ``mem_bank`` is the full [B, layer_memory_slots, T, C] bank (embedding slot + streaming
+    slots); reuses the same tokenwise attention as the windowed router.
+    """
+    routed = tokenwise_layer_attention_from_bank(route, x_prev, mem_bank, cfg)
+    gate = jax.nn.sigmoid(route["gate"])
+    return gate * routed + (1.0 - gate) * x_prev
+
+
 def route_block_input(params, x_prev, states, cfg, *, block_index):
     if not cfg.use_layer_attention or block_index == 0:
         return x_prev

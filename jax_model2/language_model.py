@@ -6,6 +6,9 @@ from jax_model.rope import precompute_rope_cache
 
 from .config import resolve_block_layout
 from .layers import (
+    horizontal_block_forward,
+    memory_router_write,
+    route_block_input_memory,
     routed_block_forward,
     span_block_forward,
     tokenwise_layer_attention,
@@ -48,6 +51,63 @@ def _scan_routed_span_run(stacked_params, x0, window, cfg, kind, span_backend, r
 
     window, _ = jax.lax.scan(step, window, stacked_params)
     return window  # final window; x_out of the run == window[:, -1]
+
+
+def _memory_block(block, x, x0, mem, cfg, kind, cos, sin, attention_backend, span_backend, remat_blocks):
+    """One unrolled block under the memory router: read over [embedding; mem], then write."""
+
+    def apply(b, h, ms):
+        bank = jnp.concatenate([x0[:, None], ms], axis=1)  # [B, layer_memory_slots, T, C]
+        x_in = route_block_input_memory(b["route"], h, bank, cfg)
+        out = horizontal_block_forward(b, x_in, cfg, kind, cos, sin, attention_backend, span_backend)
+        return out, memory_router_write(b["route"], ms, out, cfg)
+
+    return jax.checkpoint(apply)(block, x, mem) if remat_blocks else apply(block, x, mem)
+
+
+def _scan_memory_span_run(stacked_params, x0, x_init, mem, cfg, kind, span_backend, remat_blocks):
+    """A homogeneous span run under the memory router as one lax.scan; carry = (x, mem)."""
+
+    def body(carry, block_params):
+        x, ms = carry
+        bank = jnp.concatenate([x0[:, None], ms], axis=1)
+        x_in = route_block_input_memory(block_params["route"], x, bank, cfg)
+        out = span_block_forward(block_params, x_in, cfg, kind, span_backend)
+        return out, memory_router_write(block_params["route"], ms, out, cfg)
+
+    body = jax.checkpoint(body) if remat_blocks else body
+
+    def step(carry, block_params):
+        return body(carry, block_params), None
+
+    (x, mem), _ = jax.lax.scan(step, (x_init, mem), stacked_params)
+    return x, mem
+
+
+def _forward_backbone_memory(params, x, cfg, layout, cos, sin, *, attention_backend, span_backend, remat_blocks, scan_span_runs):
+    B, T, C = x.shape
+    blocks = params["blocks"]
+    n = len(blocks)
+    x0 = x  # embedding == memory slot 0 (explicit skip path), never overwritten
+    mem = jnp.broadcast_to(params["mem_init"][None, :, None, :], (B, cfg.layer_memory_slots - 1, T, C))
+    i = 0
+    while i < n:
+        kind = layout[i]
+        if scan_span_runs and kind in SPAN_KINDS:
+            j = i + 1
+            while j < n and layout[j] == kind:
+                j += 1
+            if j - i > 1:
+                x, mem = _scan_memory_span_run(
+                    _stack_same_structure(blocks[i:j]), x0, x, mem, cfg, kind, span_backend, remat_blocks
+                )
+                i = j
+                continue
+        x, mem = _memory_block(
+            blocks[i], x, x0, mem, cfg, kind, cos, sin, attention_backend, span_backend, remat_blocks
+        )
+        i += 1
+    return x
 
 
 def _forward_one_block(
@@ -96,6 +156,22 @@ def forward_backbone(
     layout = resolve_block_layout(cfg)
     cos, sin = precompute_rope_cache(cfg.n_embd // cfg.n_head, T, dtype=params["token_embedding"]["weight"].dtype)
     x = params["token_embedding"]["weight"][idx]
+
+    if cfg.use_memory_router:
+        x = _forward_backbone_memory(
+            params,
+            x,
+            cfg,
+            layout,
+            cos,
+            sin,
+            attention_backend=attention_backend,
+            span_backend=span_backend,
+            remat_blocks=remat_blocks,
+            scan_span_runs=scan_span_runs,
+        )
+        return layer_norm(x, params["ln_f"])
+
     blocks = params["blocks"]
     n = len(blocks)
     max_src = cfg.layer_attn_max_sources

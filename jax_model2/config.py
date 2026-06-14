@@ -48,6 +48,14 @@ class LayerRoutedHGConfig:
     route_gate_init: float = 2.0
     initializer_std: float = 0.02
 
+    # Cross-layer "HCA" memory router. When True, each block routes (per token) over a fixed
+    # set of layer_memory_slots compressed memory slots that summarize the WHOLE vertical stack
+    # so far, instead of the last layer_attn_max_sources raw states. Slot 0 is the token
+    # embedding (kept as an explicit skip path); the remaining slots are a streaming memory
+    # updated after each block by a learned softmax write (HCA-style pooling on the layer axis).
+    use_memory_router: bool = False
+    layer_memory_slots: int = 4
+
 
 def resolve_block_layout(cfg: LayerRoutedHGConfig):
     layout = cfg.block_layout if cfg.block_layout is not None else default_block_layout()
