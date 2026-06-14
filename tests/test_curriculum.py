@@ -1,11 +1,23 @@
 import unittest
+import json
+import os
+import sys
+import tempfile
+import types
+from unittest import mock
 
 import numpy as np
 
 from curriculum_data import (
     CurriculumLoader,
     CurriculumPhase,
+    REDPAJAMA_SOURCE,
+    REDPAJAMA_DATA_DIR_ENV,
+    REDPAJAMA_URLS_FILE_ENV,
     default_curriculum,
+    _hf_document_tokens,
+    _redpajama_document_tokens,
+    _redpajama_subset_urls,
     pack_token_stream,
     phase_boundaries,
     phase_for_step,
@@ -45,6 +57,9 @@ class PhaseScheduleTest(unittest.TestCase):
         self.assertEqual([p.label for p in phases], ["simple-wiki", "en-wiki", "arxiv"])
         self.assertEqual(phases[0].dataset_config, "20231101.simple")
         self.assertEqual(phases[1].dataset_config, "20231101.en")
+        self.assertEqual(phases[2].dataset_name, "togethercomputer/RedPajama-Data-1T")
+        self.assertEqual(phases[2].dataset_config, "arxiv")
+        self.assertEqual(phases[2].source, REDPAJAMA_SOURCE)
 
     def test_default_curriculum_remainder_goes_to_last(self):
         # 0.2/0.4/0.4 of 999 rounds to 200/400, so arxiv must absorb the remaining 399.
@@ -72,6 +87,104 @@ class PackingTest(unittest.TestCase):
         x, y = next(pack_token_stream(docs, eos_id=0, block_size=4, batch_size=3))
         self.assertEqual(x.shape, (3, 4))
         self.assertEqual(y.shape, (3, 4))
+
+
+class HoldoutSplitTest(unittest.TestCase):
+    def test_hf_stream_slices_before_shuffle(self):
+        operations = []
+
+        class FakeStream:
+            def __init__(self, rows):
+                self.rows = list(rows)
+
+            def skip(self, n):
+                operations.append(("skip", n))
+                return FakeStream(self.rows[n:])
+
+            def take(self, n):
+                operations.append(("take", n))
+                return FakeStream(self.rows[:n])
+
+            def shuffle(self, buffer_size, seed):
+                operations.append(("shuffle", buffer_size, seed))
+                return self
+
+            def __iter__(self):
+                return iter(self.rows)
+
+        def fake_load_dataset(*args, **kwargs):
+            operations.append(("load_dataset", args, kwargs))
+            return FakeStream([{"text": "a"}, {"text": "b"}, {"text": "c"}, {"text": "d"}])
+
+        fake_datasets = types.SimpleNamespace(load_dataset=fake_load_dataset)
+        phase = CurriculumPhase("train", "fake", None, steps=1, text_field="text")
+        with mock.patch.dict(sys.modules, {"datasets": fake_datasets}):
+            docs = list(
+                _hf_document_tokens(
+                    phase,
+                    FakeTokenizer(),
+                    shuffle=True,
+                    seed=7,
+                    shuffle_buffer=11,
+                    skip_docs=1,
+                    take_docs=2,
+                )
+            )
+
+        self.assertEqual(operations[1:], [("skip", 1), ("take", 2), ("shuffle", 11, 7)])
+        self.assertEqual(docs, [[ord("b")], [ord("c")]])
+
+
+class RedPajamaRawStreamTest(unittest.TestCase):
+    def test_filters_manifest_by_subset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            urls_path = os.path.join(tmp, "urls.txt")
+            with open(urls_path, "w", encoding="utf-8") as f:
+                f.write("https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/a.jsonl\n")
+                f.write("https://data.together.xyz/redpajama-data-1T/v1.0.0/github/g.jsonl\n")
+                f.write("https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/b.jsonl\n")
+            with mock.patch.dict(os.environ, {REDPAJAMA_URLS_FILE_ENV: urls_path}, clear=False):
+                urls = _redpajama_subset_urls("arxiv")
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(all("/arxiv/" in url for url in urls))
+
+    def test_streams_local_jsonl_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            urls_path = os.path.join(tmp, "urls.txt")
+            shard_dir = os.path.join(tmp, "arxiv")
+            os.makedirs(shard_dir)
+            shard_path = os.path.join(shard_dir, "sample.jsonl")
+            url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/sample.jsonl"
+            with open(urls_path, "w", encoding="utf-8") as f:
+                f.write(url + "\n")
+            with open(shard_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"text": "alpha"}) + "\n")
+                f.write(json.dumps({"text": ""}) + "\n")
+                f.write(json.dumps({"text": "beta"}) + "\n")
+            phase = CurriculumPhase(
+                "arxiv",
+                "togethercomputer/RedPajama-Data-1T",
+                "arxiv",
+                steps=1,
+                source=REDPAJAMA_SOURCE,
+            )
+            env = {
+                REDPAJAMA_URLS_FILE_ENV: urls_path,
+                REDPAJAMA_DATA_DIR_ENV: tmp,
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                docs = list(
+                    _redpajama_document_tokens(
+                        phase,
+                        FakeTokenizer(),
+                        shuffle=False,
+                        seed=0,
+                        shuffle_buffer=10,
+                        skip_docs=1,
+                        take_docs=1,
+                    )
+                )
+        self.assertEqual(docs, [[ord("b"), ord("e"), ord("t"), ord("a")]])
 
 
 class CurriculumLoaderTest(unittest.TestCase):

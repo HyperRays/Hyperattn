@@ -4,7 +4,7 @@ Trains on progressively harder corpora with hard cuts at step boundaries:
 
     1. grammar-heavy   -> Simple English Wikipedia   (wikimedia/wikipedia 20231101.simple)
     2. informational   -> full English Wikipedia      (wikimedia/wikipedia 20231101.en)
-    3. information-dense -> full-text arXiv papers     (togethercomputer/RedPajama-Data-1T:arxiv)
+    3. information-dense -> full-text arXiv papers     (RedPajama raw URL stream:arxiv)
 
 Packing matches the runner's original StreamingPackedTokens: each document is tokenized,
 terminated with an EOS id, the ids are concatenated, and the flat stream is sliced into
@@ -17,12 +17,26 @@ packing core can be imported and unit tested without ``datasets``/``transformers
 
 from __future__ import annotations
 
+import gzip
+import io
+import json
+import os
 import queue
+import random
 import threading
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Tuple
+from urllib.request import Request, urlopen
 
 import numpy as np
+
+
+REDPAJAMA_SOURCE = "redpajama_urls"
+REDPAJAMA_MANIFEST_URL = "https://data.together.xyz/redpajama-data-1T/v1.0.0/urls.txt"
+REDPAJAMA_DATA_DIR_ENV = "RED_PAJAMA_DATA_DIR"
+REDPAJAMA_URLS_FILE_ENV = "RED_PAJAMA_URLS_FILE"
+REDPAJAMA_MANIFEST_URL_ENV = "RED_PAJAMA_MANIFEST_URL"
+REDPAJAMA_DOC_SHUFFLE_BUFFER_ENV = "RED_PAJAMA_DOC_SHUFFLE_BUFFER"
 
 
 # --------------------------------------------------------------------------------------
@@ -37,6 +51,7 @@ class CurriculumPhase:
     text_field: str = "text"
     split: str = "train"
     trust_remote_code: bool = False
+    source: str = "hf"
 
 
 def phase_boundaries(phases: List[CurriculumPhase]) -> List[int]:
@@ -64,13 +79,16 @@ def default_curriculum(
     arxiv_dataset: str = "togethercomputer/RedPajama-Data-1T",
     arxiv_config: Optional[str] = "arxiv",
     arxiv_text_field: str = "text",
-    arxiv_trust_remote_code: bool = True,
+    arxiv_trust_remote_code: bool = False,
+    arxiv_source: str = REDPAJAMA_SOURCE,
 ) -> List[CurriculumPhase]:
     """Three-stage curriculum sized as fractions of ``max_iters``.
 
     The last phase absorbs the rounding remainder so the phase steps sum exactly to
-    ``max_iters``. Swap the arXiv source to ``ccdv/arxiv-summarization`` (config
-    ``document``, field ``article``) if RedPajama streaming is unavailable.
+    ``max_iters``. RedPajama is streamed from Together's raw URL manifest by default,
+    avoiding the HuggingFace dataset script that current ``datasets`` versions reject.
+    Set ``arxiv_source="hf"`` with e.g. ``ccdv/arxiv-summarization`` if you want the
+    script-free HuggingFace fallback instead.
     """
     f1, f2, _f3 = fractions
     s1 = round(f1 * max_iters)
@@ -86,6 +104,7 @@ def default_curriculum(
             s3,
             text_field=arxiv_text_field,
             trust_remote_code=arxiv_trust_remote_code,
+            source=arxiv_source,
         ),
     ]
 
@@ -122,8 +141,131 @@ def pack_token_stream(
 
 
 # --------------------------------------------------------------------------------------
-# HuggingFace streaming glue
+# Document streaming glue
 # --------------------------------------------------------------------------------------
+def _redpajama_manifest_lines() -> List[str]:
+    """Load Together's RedPajama URL manifest from a local file or from the public URL."""
+    urls_file = os.environ.get(REDPAJAMA_URLS_FILE_ENV)
+    if urls_file:
+        with open(urls_file, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    manifest_url = os.environ.get(REDPAJAMA_MANIFEST_URL_ENV, REDPAJAMA_MANIFEST_URL)
+    req = Request(manifest_url, headers={"User-Agent": "Hyperattn/RedPajamaRawStream"})
+    with urlopen(req, timeout=60) as response:
+        text = response.read().decode("utf-8")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _redpajama_subset_urls(subset: Optional[str]) -> List[str]:
+    subset = subset or "arxiv"
+    needle = f"/{subset}/"
+    urls = [url for url in _redpajama_manifest_lines() if needle in url]
+    if not urls:
+        raise RuntimeError(f"RedPajama manifest contained no URLs for subset {subset!r}")
+    return urls
+
+
+def _local_redpajama_path(url: str) -> Optional[str]:
+    """Map a public RedPajama URL to RED_PAJAMA_DATA_DIR if the shard was predownloaded."""
+    root = os.environ.get(REDPAJAMA_DATA_DIR_ENV)
+    if not root:
+        return None
+    marker = "/redpajama-data-1T/v1.0.0/"
+    rel = url.split(marker, 1)[1] if marker in url else url.rsplit("/", 1)[-1]
+    path = os.path.join(root, rel)
+    return path if os.path.exists(path) else None
+
+
+def _open_binary_url_or_file(url: str):
+    local_path = _local_redpajama_path(url)
+    if local_path is not None:
+        return open(local_path, "rb")
+    req = Request(url, headers={"User-Agent": "Hyperattn/RedPajamaRawStream"})
+    return urlopen(req, timeout=120)
+
+
+def _iter_jsonl_lines_from_url(url: str) -> Iterator[str]:
+    raw = _open_binary_url_or_file(url)
+    try:
+        if url.endswith(".gz"):
+            with gzip.GzipFile(fileobj=raw) as gz:
+                wrapper = io.TextIOWrapper(gz, encoding="utf-8", errors="replace")
+                yield from wrapper
+        elif url.endswith(".zst") or url.endswith(".zstd"):
+            try:
+                import zstandard as zstd
+            except ImportError as exc:
+                raise RuntimeError(
+                    "RedPajama shards are zstd-compressed; install `zstandard` or use "
+                    "`uv add zstandard` before streaming raw RedPajama URLs."
+                ) from exc
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(raw) as reader:
+                wrapper = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+                yield from wrapper
+        else:
+            wrapper = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+            yield from wrapper
+    finally:
+        raw.close()
+
+
+def _shuffle_buffered(items, *, buffer_size: int, seed: int):
+    rng = random.Random(seed)
+    buffer: List[List[int]] = []
+    iterator = iter(items)
+    for _ in range(max(0, buffer_size)):
+        try:
+            buffer.append(next(iterator))
+        except StopIteration:
+            break
+    if not buffer:
+        return
+    for item in iterator:
+        idx = rng.randrange(len(buffer))
+        yield buffer[idx]
+        buffer[idx] = item
+    rng.shuffle(buffer)
+    yield from buffer
+
+
+def _redpajama_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip_docs, take_docs):
+    urls = _redpajama_subset_urls(phase.dataset_config)
+    rng = random.Random(seed)
+    if shuffle:
+        urls = list(urls)
+        rng.shuffle(urls)
+
+    def docs():
+        seen = 0
+        yielded = 0
+        for url in urls:
+            for line in _iter_jsonl_lines_from_url(url):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = row.get(phase.text_field)
+                if not isinstance(text, str) or len(text) == 0:
+                    continue
+                if seen < skip_docs:
+                    seen += 1
+                    continue
+                if take_docs is not None and yielded >= take_docs:
+                    return
+                seen += 1
+                yielded += 1
+                yield text
+
+    texts = docs()
+    if shuffle:
+        doc_buffer = int(os.environ.get(REDPAJAMA_DOC_SHUFFLE_BUFFER_ENV, "256"))
+        texts = _shuffle_buffered(texts, buffer_size=min(shuffle_buffer, doc_buffer), seed=seed)
+    for text in texts:
+        yield tokenizer.encode(text, add_special_tokens=False)
+
+
 def _hf_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip_docs, take_docs):
     from datasets import load_dataset
 
@@ -150,6 +292,30 @@ def _hf_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip
         yield tokenizer.encode(text, add_special_tokens=False)
 
 
+def _document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip_docs, take_docs):
+    if phase.source == REDPAJAMA_SOURCE:
+        return _redpajama_document_tokens(
+            phase,
+            tokenizer,
+            shuffle=shuffle,
+            seed=seed,
+            shuffle_buffer=shuffle_buffer,
+            skip_docs=skip_docs,
+            take_docs=take_docs,
+        )
+    if phase.source == "hf":
+        return _hf_document_tokens(
+            phase,
+            tokenizer,
+            shuffle=shuffle,
+            seed=seed,
+            shuffle_buffer=shuffle_buffer,
+            skip_docs=skip_docs,
+            take_docs=take_docs,
+        )
+    raise ValueError(f"unknown curriculum source {phase.source!r}")
+
+
 def phase_batch_iter(
     phase,
     tokenizer,
@@ -166,7 +332,7 @@ def phase_batch_iter(
     eos_id = tokenizer.eos_token_id
     epoch = 0
     while True:
-        docs = _hf_document_tokens(
+        docs = _document_tokens(
             phase,
             tokenizer,
             shuffle=shuffle,
