@@ -37,6 +37,7 @@ REDPAJAMA_DATA_DIR_ENV = "RED_PAJAMA_DATA_DIR"
 REDPAJAMA_URLS_FILE_ENV = "RED_PAJAMA_URLS_FILE"
 REDPAJAMA_MANIFEST_URL_ENV = "RED_PAJAMA_MANIFEST_URL"
 REDPAJAMA_DOC_SHUFFLE_BUFFER_ENV = "RED_PAJAMA_DOC_SHUFFLE_BUFFER"
+REDPAJAMA_TOKENIZE_BATCH_ENV = "RED_PAJAMA_TOKENIZE_BATCH"
 
 
 # --------------------------------------------------------------------------------------
@@ -230,6 +231,28 @@ def _shuffle_buffered(items, *, buffer_size: int, seed: int):
     yield from buffer
 
 
+def _batched_tokenize_texts(texts, tokenizer, *, batch_size: int):
+    batch = []
+    batch_size = max(1, int(batch_size))
+    for text in texts:
+        batch.append(text)
+        if len(batch) == batch_size:
+            try:
+                for ids in tokenizer(batch, add_special_tokens=False)["input_ids"]:
+                    yield ids
+            except TypeError:
+                for item in batch:
+                    yield tokenizer.encode(item, add_special_tokens=False)
+            batch = []
+    if batch:
+        try:
+            for ids in tokenizer(batch, add_special_tokens=False)["input_ids"]:
+                yield ids
+        except TypeError:
+            for item in batch:
+                yield tokenizer.encode(item, add_special_tokens=False)
+
+
 def _redpajama_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip_docs, take_docs):
     urls = _redpajama_subset_urls(phase.dataset_config)
     rng = random.Random(seed)
@@ -262,8 +285,8 @@ def _redpajama_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffe
     if shuffle:
         doc_buffer = int(os.environ.get(REDPAJAMA_DOC_SHUFFLE_BUFFER_ENV, "256"))
         texts = _shuffle_buffered(texts, buffer_size=min(shuffle_buffer, doc_buffer), seed=seed)
-    for text in texts:
-        yield tokenizer.encode(text, add_special_tokens=False)
+    tokenize_batch = int(os.environ.get(REDPAJAMA_TOKENIZE_BATCH_ENV, "4"))
+    yield from _batched_tokenize_texts(texts, tokenizer, batch_size=tokenize_batch)
 
 
 def _hf_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffer, skip_docs, take_docs):
