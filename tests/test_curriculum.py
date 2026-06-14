@@ -13,10 +13,15 @@ from curriculum_data import (
     CurriculumPhase,
     REDPAJAMA_SOURCE,
     REDPAJAMA_DATA_DIR_ENV,
+    REDPAJAMA_BACKGROUND_SHARDS_ENV,
+    REDPAJAMA_DOWNLOAD_VERBOSE_ENV,
+    REDPAJAMA_PREFETCH_SHARDS_ENV,
     REDPAJAMA_URLS_FILE_ENV,
     default_curriculum,
+    _download_redpajama_shard,
     _hf_document_tokens,
     _redpajama_document_tokens,
+    _redpajama_cache_path,
     _redpajama_subset_urls,
     pack_token_stream,
     phase_boundaries,
@@ -185,6 +190,84 @@ class RedPajamaRawStreamTest(unittest.TestCase):
                     )
                 )
         self.assertEqual(docs, [[ord("b"), ord("e"), ord("t"), ord("a")]])
+
+    def test_cache_path_maps_manifest_layout(self):
+        url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/sample.jsonl"
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {REDPAJAMA_DATA_DIR_ENV: tmp}, clear=False):
+                self.assertEqual(_redpajama_cache_path(url), os.path.join(tmp, "arxiv", "sample.jsonl"))
+
+    def test_download_shard_writes_atomic_cache_file(self):
+        url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/sample.jsonl"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, n=-1):
+                if getattr(self, "_done", False):
+                    return b""
+                self._done = True
+                return b'{"text":"alpha"}\n'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {REDPAJAMA_DATA_DIR_ENV: tmp}
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch("curriculum_data.urlopen", return_value=FakeResponse()):
+                path = _download_redpajama_shard(url, verbose=False)
+            self.assertTrue(os.path.exists(path))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b'{"text":"alpha"}\n')
+
+    def test_prefetch_downloads_before_streaming(self):
+        url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/arxiv/sample.jsonl"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, n=-1):
+                if getattr(self, "_done", False):
+                    return b""
+                self._done = True
+                return b'{"text":"alpha"}\n'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            urls_path = os.path.join(tmp, "urls.txt")
+            with open(urls_path, "w", encoding="utf-8") as f:
+                f.write(url + "\n")
+            phase = CurriculumPhase(
+                "arxiv",
+                "togethercomputer/RedPajama-Data-1T",
+                "arxiv",
+                steps=1,
+                source=REDPAJAMA_SOURCE,
+            )
+            env = {
+                REDPAJAMA_URLS_FILE_ENV: urls_path,
+                REDPAJAMA_DATA_DIR_ENV: tmp,
+                REDPAJAMA_PREFETCH_SHARDS_ENV: "1",
+                REDPAJAMA_BACKGROUND_SHARDS_ENV: "0",
+                REDPAJAMA_DOWNLOAD_VERBOSE_ENV: "0",
+            }
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch("curriculum_data.urlopen", return_value=FakeResponse()):
+                docs = list(
+                    _redpajama_document_tokens(
+                        phase,
+                        FakeTokenizer(),
+                        shuffle=False,
+                        seed=0,
+                        shuffle_buffer=10,
+                        skip_docs=0,
+                        take_docs=1,
+                    )
+                )
+        self.assertEqual(docs, [[ord("a"), ord("l"), ord("p"), ord("h"), ord("a")]])
 
 
 class CurriculumLoaderTest(unittest.TestCase):

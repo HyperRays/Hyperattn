@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import random
+import shutil
 import threading
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Tuple
@@ -38,6 +39,12 @@ REDPAJAMA_URLS_FILE_ENV = "RED_PAJAMA_URLS_FILE"
 REDPAJAMA_MANIFEST_URL_ENV = "RED_PAJAMA_MANIFEST_URL"
 REDPAJAMA_DOC_SHUFFLE_BUFFER_ENV = "RED_PAJAMA_DOC_SHUFFLE_BUFFER"
 REDPAJAMA_TOKENIZE_BATCH_ENV = "RED_PAJAMA_TOKENIZE_BATCH"
+REDPAJAMA_PREFETCH_SHARDS_ENV = "RED_PAJAMA_PREFETCH_SHARDS"
+REDPAJAMA_BACKGROUND_SHARDS_ENV = "RED_PAJAMA_BACKGROUND_SHARDS"
+REDPAJAMA_DOWNLOAD_WORKERS_ENV = "RED_PAJAMA_DOWNLOAD_WORKERS"
+REDPAJAMA_DOWNLOAD_VERBOSE_ENV = "RED_PAJAMA_DOWNLOAD_VERBOSE"
+
+_REDPAJAMA_DOWNLOADERS = {}
 
 
 # --------------------------------------------------------------------------------------
@@ -167,15 +174,106 @@ def _redpajama_subset_urls(subset: Optional[str]) -> List[str]:
     return urls
 
 
-def _local_redpajama_path(url: str) -> Optional[str]:
-    """Map a public RedPajama URL to RED_PAJAMA_DATA_DIR if the shard was predownloaded."""
+def _redpajama_cache_path(url: str) -> Optional[str]:
+    """Map a public RedPajama URL to its intended path under RED_PAJAMA_DATA_DIR."""
     root = os.environ.get(REDPAJAMA_DATA_DIR_ENV)
     if not root:
         return None
     marker = "/redpajama-data-1T/v1.0.0/"
     rel = url.split(marker, 1)[1] if marker in url else url.rsplit("/", 1)[-1]
-    path = os.path.join(root, rel)
+    return os.path.join(root, rel)
+
+
+def _local_redpajama_path(url: str) -> Optional[str]:
+    """Return the cached RedPajama shard path if present."""
+    path = _redpajama_cache_path(url)
     return path if os.path.exists(path) else None
+
+
+def _download_redpajama_shard(url: str, *, verbose: bool = False) -> Optional[str]:
+    """Download one RedPajama shard into RED_PAJAMA_DATA_DIR using an atomic rename."""
+    path = _redpajama_cache_path(url)
+    if path is None:
+        return None
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    if verbose:
+        print(f"[redpajama] downloading {url} -> {path}", flush=True)
+    req = Request(url, headers={"User-Agent": "Hyperattn/RedPajamaRawStream"})
+    try:
+        with urlopen(req, timeout=120) as response, open(tmp_path, "wb") as f:
+            shutil.copyfileobj(response, f, length=1024 * 1024)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    if verbose:
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        print(f"[redpajama] cached {path} ({size_mb:.1f} MiB)", flush=True)
+    return path
+
+
+class _RedPajamaBackgroundDownloader:
+    def __init__(self, urls: List[str], *, workers: int, verbose: bool):
+        self.urls = list(urls)
+        self.verbose = verbose
+        self._q: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._threads = []
+        for url in self.urls:
+            if _local_redpajama_path(url) is None:
+                self._q.put(url)
+        for _ in range(max(1, int(workers))):
+            thread = threading.Thread(target=self._worker, daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                url = self._q.get(timeout=0.5)
+            except queue.Empty:
+                return
+            try:
+                _download_redpajama_shard(url, verbose=self.verbose)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[redpajama] background download failed for {url}: {exc}", flush=True)
+            finally:
+                self._q.task_done()
+
+    def stop(self):
+        self._stop.set()
+
+
+def _maybe_prepare_redpajama_cache(urls: List[str]) -> None:
+    """Optionally predownload/cache RedPajama shards before and during streaming.
+
+    Enabled only when RED_PAJAMA_DATA_DIR is set. Synchronous prefetch downloads the first
+    RED_PAJAMA_PREFETCH_SHARDS URLs before yielding data. Background download then caches up
+    to RED_PAJAMA_BACKGROUND_SHARDS URLs from this shuffled epoch order.
+    """
+    if not os.environ.get(REDPAJAMA_DATA_DIR_ENV):
+        return
+    prefetch_n = max(0, int(os.environ.get(REDPAJAMA_PREFETCH_SHARDS_ENV, "0")))
+    background_n = max(0, int(os.environ.get(REDPAJAMA_BACKGROUND_SHARDS_ENV, "0")))
+    workers = max(1, int(os.environ.get(REDPAJAMA_DOWNLOAD_WORKERS_ENV, "2")))
+    verbose = os.environ.get(REDPAJAMA_DOWNLOAD_VERBOSE_ENV, "1") not in {"0", "false", "False"}
+    if prefetch_n:
+        for url in urls[:prefetch_n]:
+            _download_redpajama_shard(url, verbose=verbose)
+    if background_n:
+        key = (os.environ.get(REDPAJAMA_DATA_DIR_ENV), tuple(urls[:background_n]))
+        old = _REDPAJAMA_DOWNLOADERS.get(key)
+        if old is None:
+            _REDPAJAMA_DOWNLOADERS[key] = _RedPajamaBackgroundDownloader(
+                urls[:background_n], workers=workers, verbose=verbose
+            )
 
 
 def _open_binary_url_or_file(url: str):
@@ -259,6 +357,7 @@ def _redpajama_document_tokens(phase, tokenizer, *, shuffle, seed, shuffle_buffe
     if shuffle:
         urls = list(urls)
         rng.shuffle(urls)
+    _maybe_prepare_redpajama_cache(urls)
 
     def docs():
         seen = 0
