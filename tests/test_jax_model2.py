@@ -67,6 +67,44 @@ class JaxModel2Test(unittest.TestCase):
         self.assertTrue(np.isfinite(float(loss)))
         self.assertEqual(jax.tree.structure(grads), jax.tree.structure(self.params))
 
+    def test_scan_span_runs_parity(self):
+        # A layout deep enough that, with a small source cap, the trailing local_span run is
+        # fully capped (starts at block index >= max_sources) and therefore gets scanned.
+        cfg = jax_model2.LayerRoutedHGConfig(
+            vocab_size=53,
+            block_size=12,
+            n_embd=24,
+            n_head=4,
+            local_window=5,
+            block_layout=("attn", "mid_span", "mid_span", "local_span", "local_span", "local_span", "local_span"),
+            mid_span_widths=(3, 5),
+            mid_span_lags=(1, 2),
+            local_span_widths=(2, 4),
+            local_span_lags=(0,),
+            layer_attn_max_sources=3,  # local run starts at block 3 >= 3 -> scannable
+        )
+        params = jax_model2.init_params(jax.random.PRNGKey(7), cfg)
+        idx = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 5) % cfg.vocab_size
+        targets = (idx + 1) % cfg.vocab_size
+
+        kw = dict(attention_backend="chunked", span_backend="fused", remat_blocks=True)
+        logits_unrolled = jax_model2.forward(params, idx, cfg, scan_span_runs=False, **kw)
+        logits_scanned = jax_model2.forward(params, idx, cfg, scan_span_runs=True, **kw)
+        np.testing.assert_allclose(
+            np.asarray(logits_scanned), np.asarray(logits_unrolled), rtol=1e-5, atol=1e-5
+        )
+
+        # jax-metal segfaults when differentiating through lax.scan; grad parity is verified on
+        # CPU/TPU (where the real run lives), see [[jax-metal-lowering-pitfalls]].
+        if jax.default_backend() == "METAL":
+            self.skipTest("jax-metal cannot differentiate through lax.scan; grad parity checked on CPU/TPU")
+
+        l0, g0 = jax.value_and_grad(jax_model2.loss)(params, idx, targets, cfg, scan_span_runs=False, **kw)
+        l1, g1 = jax.value_and_grad(jax_model2.loss)(params, idx, targets, cfg, scan_span_runs=True, **kw)
+        np.testing.assert_allclose(float(l1), float(l0), rtol=1e-5, atol=1e-5)
+        for a, b in zip(jax.tree_util.tree_leaves(g0), jax.tree_util.tree_leaves(g1)):
+            np.testing.assert_allclose(np.asarray(b), np.asarray(a), rtol=1e-4, atol=1e-5)
+
     def test_layer_attention_weight_shapes(self):
         weights = jax_model2.layer_attention_weights(self.params, self.idx, self.cfg)
         self.assertEqual(len(weights), len(self.cfg.block_layout) - 1)

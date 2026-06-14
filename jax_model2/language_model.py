@@ -5,7 +5,44 @@ from jax_model.ops import layer_norm, linear_cross_entropy
 from jax_model.rope import precompute_rope_cache
 
 from .config import resolve_block_layout
-from .layers import routed_block_forward, tokenwise_layer_attention
+from .layers import (
+    routed_block_forward,
+    span_block_forward,
+    tokenwise_layer_attention,
+    tokenwise_layer_attention_from_bank,
+)
+
+SPAN_KINDS = ("far_span", "mid_span", "local_span")
+
+
+def _stack_same_structure(blocks):
+    return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *blocks)
+
+
+def _scan_routed_span_run(stacked_params, x0, window, cfg, kind, span_backend, remat_blocks):
+    """Run a homogeneous, fully-capped span run as a single lax.scan.
+
+    Within the run depth always exceeds layer_attn_max_sources, so every block routes over
+    exactly ``embedding (x0) + the last (max_sources - 1) outputs``. That window is a
+    fixed-size carry, so the run compiles to one block body instead of being unrolled.
+    ``window`` is [B, K, T, C] (K = max_sources - 1), oldest-first, newest == x_prev.
+    """
+
+    def step(win, block_params):
+        x_prev = win[:, -1]
+        bank = jnp.concatenate([x0[:, None], win], axis=1)  # [B, max_sources, T, C]
+        routed = tokenwise_layer_attention_from_bank(block_params["route"], x_prev, bank, cfg)
+        gate = jax.nn.sigmoid(block_params["route"]["gate"])
+        x_in = gate * routed + (1.0 - gate) * x_prev
+
+        def apply(p, h):
+            return span_block_forward(p, h, cfg, kind, span_backend)
+
+        x_out = jax.checkpoint(apply)(block_params, x_in) if remat_blocks else apply(block_params, x_in)
+        return jnp.concatenate([win[:, 1:], x_out[:, None]], axis=1), None
+
+    window, _ = jax.lax.scan(step, window, stacked_params)
+    return window  # final window; x_out of the run == window[:, -1]
 
 
 def _forward_one_block(
@@ -47,16 +84,50 @@ def forward_backbone(
     attention_backend="windowed",
     span_backend="fused",
     remat_blocks=False,
+    scan_span_runs=False,
 ):
     _, T = idx.shape
     assert T <= cfg.block_size
     layout = resolve_block_layout(cfg)
     cos, sin = precompute_rope_cache(cfg.n_embd // cfg.n_head, T, dtype=params["token_embedding"]["weight"].dtype)
     x = params["token_embedding"]["weight"][idx]
+    blocks = params["blocks"]
+    n = len(blocks)
+    max_src = cfg.layer_attn_max_sources
+    # A homogeneous span run starting at block i is "fully capped" (every block routes over
+    # exactly max_src sources) iff i >= max_src; only then can it be scanned as a fixed-size
+    # window. max_src must be >= 2 (max_src == 1 drops the embedding source). Earlier/shorter
+    # runs and attention blocks stay unrolled.
+    can_scan = scan_span_runs and cfg.use_layer_attention and max_src is not None and max_src >= 2
+
     states = (x,)
-    for i, (kind, block) in enumerate(zip(layout, params["blocks"])):
+    i = 0
+    while i < n:
+        kind = layout[i]
+        if can_scan and kind in SPAN_KINDS and i >= max_src:
+            j = i + 1
+            while j < n and layout[j] == kind:
+                j += 1
+            if j - i > 1:
+                k = max_src - 1
+                window = jnp.stack(states[-k:], axis=1)  # [B, K, T, C], oldest-first
+                window = _scan_routed_span_run(
+                    _stack_same_structure(blocks[i:j]),
+                    states[0],
+                    window,
+                    cfg,
+                    kind,
+                    span_backend,
+                    remat_blocks,
+                )
+                x = window[:, -1]
+                # Collapse history to (embedding, last K outputs): all that capped routing in
+                # the following blocks can ever read, and exactly equal to the true tail.
+                states = (states[0],) + tuple(jnp.moveaxis(window, 1, 0))
+                i = j
+                continue
         x = _forward_one_block(
-            block,
+            blocks[i],
             x,
             states,
             cfg,
@@ -69,6 +140,7 @@ def forward_backbone(
             remat_blocks=remat_blocks,
         )
         states = states + (x,)
+        i += 1
     return layer_norm(x, params["ln_f"])
 
 
@@ -80,6 +152,7 @@ def forward(
     attention_backend="windowed",
     span_backend="fused",
     remat_blocks=False,
+    scan_span_runs=False,
 ):
     hidden = forward_backbone(
         params,
@@ -88,6 +161,7 @@ def forward(
         attention_backend=attention_backend,
         span_backend=span_backend,
         remat_blocks=remat_blocks,
+        scan_span_runs=scan_span_runs,
     )
     return hidden @ params["token_embedding"]["weight"].T
 
@@ -101,6 +175,7 @@ def loss(
     attention_backend="windowed",
     span_backend="fused",
     remat_blocks=False,
+    scan_span_runs=False,
 ):
     hidden = forward_backbone(
         params,
@@ -109,6 +184,7 @@ def loss(
         attention_backend=attention_backend,
         span_backend=span_backend,
         remat_blocks=remat_blocks,
+        scan_span_runs=scan_span_runs,
     )
     return linear_cross_entropy(hidden, params["token_embedding"]["weight"], targets)
 

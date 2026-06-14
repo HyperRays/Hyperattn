@@ -18,9 +18,12 @@ def _select_layer_sources(states, max_sources):
     return (states[0],) + tuple(states[-(max_sources - 1) :])
 
 
-def tokenwise_layer_attention(params, x_prev, states, cfg):
-    sources = _select_layer_sources(states, cfg.layer_attn_max_sources)
-    bank = jnp.stack(sources, axis=1)  # [B, S, T, C]
+def tokenwise_layer_attention_from_bank(params, x_prev, bank, cfg):
+    """Tokenwise layer attention given a prebuilt source bank [B, S, T, C].
+
+    Split out from tokenwise_layer_attention so the scanned span runs can pass a
+    fixed-size rolling window instead of materializing the growing states tuple.
+    """
     q = linear(layer_norm(x_prev, params["ln"]), params["q_proj"])
     bank_norm = layer_norm(bank, params["ln"])
     k = linear(bank_norm, params["k_proj"])
@@ -29,6 +32,12 @@ def tokenwise_layer_attention(params, x_prev, states, cfg):
     weights = jax.nn.softmax(scores.astype(jnp.float32), axis=1).astype(x_prev.dtype)
     routed = jnp.einsum("bst,bstc->btc", weights, v)
     return linear(routed, params["out_proj"])
+
+
+def tokenwise_layer_attention(params, x_prev, states, cfg):
+    sources = _select_layer_sources(states, cfg.layer_attn_max_sources)
+    bank = jnp.stack(sources, axis=1)  # [B, S, T, C]
+    return tokenwise_layer_attention_from_bank(params, x_prev, bank, cfg)
 
 
 def route_block_input(params, x_prev, states, cfg, *, block_index):
